@@ -15441,6 +15441,188 @@ static SDValue lowerShuffleAsLanePermuteAndSHUFP(const SDLoc &DL, MVT VT,
                      DAG.getTargetConstant(SHUFPMask, DL, MVT::i8));
 }
 
+/// Helper for lowerShuffleAsSublanePermuteAndPermute
+///
+/// Attempts to calculate a shuffle mask that does a cross-lane permute
+/// of the given block size to get everything in its output lane.
+///
+/// If successful, fills LaneCrossShuf and FinalShuf with masks for the
+/// lane-crossing shuffle and the shuffle needed to get elements from that
+/// shuffle into the spots required by Mask and returns true
+/// If unsuccessful, returns false without touching LaneCrossShuf or FinalShuf
+///
+/// Note: All input/output masks are in elements, not blocks
+static bool getLaneCrossShuffle(int BlockSize, int NumElts, int NumLanes,
+    ArrayRef<int> Mask, ArrayRef<int> SrcUsage, ArrayRef<int> PreShuf,
+    SmallVectorImpl<int> &LaneCrossShuf, SmallVectorImpl<int> &FinalShuf) {
+  int NumBlocksPerLane = 128 / BlockSize;
+  int NumBlocks = NumBlocksPerLane * NumLanes;
+  int NumEltsPerBlock = NumElts / NumBlocks;
+  int NumEltsPerLane = NumElts / NumLanes;
+
+  // The cross-lane shuffle
+  SmallVector<int, 16> BlockShuf(NumBlocks, SM_SentinelUndef);
+  SmallVector<MutableArrayRef<int>, 4> BlockShufInsertion(NumLanes);
+  for (int i = 0; i < NumLanes; i++) {
+    BlockShufInsertion[i] = {
+      &BlockShuf[i*NumBlocksPerLane],
+      static_cast<size_t>(NumBlocksPerLane) };
+  }
+
+  // Fill BlockShuf
+  for (int Block = 0; Block < NumBlocks; Block++) {
+    SmallVector<bool, 4> BlockLaneUsage(NumLanes, false);
+    // Find all lanes this block's elements need to be sent to
+    for (int i = Block*NumEltsPerBlock; i < (Block+1)*NumEltsPerBlock; i++) {
+      if (PreShuf[i] < 0)
+        continue;
+      uint8_t Usage = SrcUsage[PreShuf[i]];
+      for (int Lane = 0; Lane < NumLanes; Lane++) {
+        if (Usage & (1 << Lane)) {
+          BlockLaneUsage[Lane] = true;
+        }
+      }
+    }
+    // Add this block to the shuffles of the lanes it needs to be sent to
+    for (int Lane = 0; Lane < NumLanes; Lane++) {
+      if (BlockLaneUsage[Lane]) {
+        if (BlockShufInsertion[Lane].empty()) {
+          // Cross-lane permute of this block size is not possible
+          return false;
+        }
+        BlockShufInsertion[Lane].front() = Block;
+        BlockShufInsertion[Lane] = BlockShufInsertion[Lane].drop_front();
+      }
+    }
+  }
+
+  // Successfully filled BlockShuf!  The cross-lane shuffle is possible!
+  LaneCrossShuf.assign(NumElts, SM_SentinelUndef);
+  // BlockShuf combined with PreShuf
+  SmallVector<int, 64> MergedShuf(NumElts, SM_SentinelUndef);
+  for (int Block = 0; Block < NumBlocks; Block++) {
+    int Shuffle = BlockShuf[Block];
+    if (Shuffle < 0)
+      continue;
+    for (int i = 0; i < NumEltsPerBlock; i++) {
+      int EltIndex = Block*NumEltsPerBlock + i;
+      int EltShuffle = Shuffle*NumEltsPerBlock + i;
+      LaneCrossShuf[EltIndex] = EltShuffle;
+      MergedShuf[EltIndex] = PreShuf[EltShuffle];
+    }
+  }
+
+  // The final in-lane shuffle
+  FinalShuf.assign(NumElts, SM_SentinelUndef);
+  for (int Lane = 0; Lane < NumLanes; Lane++) {
+    // Inverse of MergedShuf for this lane
+    SmallVector<int, 64> MergedShufLocations(NumElts, SM_SentinelUndef);
+    // Fill MergedShufLocations with things accessible by this lane
+    for (int i = 0; i < NumEltsPerLane; i++) {
+      int EltIndex = Lane*NumEltsPerLane + i;
+      int MergedShufLocation = MergedShuf[EltIndex];
+      MergedShufLocations[MergedShufLocation] = EltIndex;
+    }
+    // Fill FinalShuf with new in-lane locations
+    for (int i = 0; i < NumEltsPerLane; i++) {
+      int EltIndex = Lane*NumEltsPerLane + i;
+      int Old = Mask[EltIndex];
+      if (Old < 0) {
+        FinalShuf[EltIndex] = Old;
+      } else {
+        int New = MergedShufLocations[Old];
+        assert(New >= 0 && "Lost an element in cross-lane shuffle");
+        FinalShuf[EltIndex] = New;
+      }
+    }
+  }
+
+  return true;
+}
+
+/// Lower a vector shuffle of <32bit items crossing multiple 128-bit lanes as
+/// a per-lane permutation, then a cross-lane permutation of >=32bit items,
+/// and finally another per-lane permutation
+///
+/// e.g:
+/// [ 3 8 2 9 1 0 e f | 4 5 6 7 c d a b ] (start)
+/// [ 0 1 2 3 8 9 e f | 4 5 6 7 c d a b ] (vpshufb)
+/// [ 0 1 2 3 4 5 6 7 | 8 9 e f c d a b ] (vpermq)
+/// [ 0 1 2 3 4 5 6 7 | 8 9 a b c d e f ] (vpshufb)
+/// This is cheaper than the base fallback of 2x vpshufb + vpermq + vpblendvb
+static SDValue lowerShuffleAsSublanePermuteAndPermute(
+    const SDLoc &DL, MVT VT, SDValue V1, SDValue V2, ArrayRef<int> Mask,
+    SelectionDAG &DAG, const X86Subtarget &Subtarget) {
+  assert(VT.getSizeInBits() >= 256 && "Only for shuffles with multiple lanes");
+  assert(VT.getSizeInBits() <= 512 && "Haven't implemented for higher");
+  assert(V2.isUndef() && "Only supports single input shuffles");
+  assert(Subtarget.hasAVX2() && "None of this works without AVX2");
+  int NumElts = VT.getVectorNumElements();
+  int NumLanes = VT.getSizeInBits() / 128;
+  int NumEltsPerLane = NumElts / NumLanes;
+
+  // Each bit indicates that an element is used in that lane
+  // (e.g. bit 0 set means element is needed by lane 0)
+  SmallVector<int, 64> SrcUsage(NumElts, 0);
+
+  // Figure out which elements are needed in what lane
+  for (int i = 0; i < NumElts; i++) {
+    int DstLane = i / NumEltsPerLane;
+    int Src = Mask[i];
+    if (Src < 0)
+      continue;
+    SrcUsage[Src] |= (1 << DstLane);
+  }
+
+  auto getOutputNode = [&](ArrayRef<int> PreShuf,
+      ArrayRef<int> LaneCross, ArrayRef<int> FinalShuf) -> SDValue {
+    SDValue SDPreShuf = DAG.getVectorShuffle(VT, DL, V1, V2, PreShuf);
+    SDValue SDLaneCross = DAG.getVectorShuffle(
+      VT, DL, SDPreShuf, DAG.getUNDEF(VT), LaneCross);
+    return DAG.getVectorShuffle(
+      VT, DL, SDLaneCross, DAG.getUNDEF(VT), FinalShuf);
+  };
+
+  SmallVector<int, 64> PreShuffle(NumElts, SM_SentinelUndef);
+  for (int i = 0; i < NumElts; i++) {
+    // Start out as identity shuffle
+    PreShuffle[i] = i;
+  }
+
+  SmallVector<int, 64> LaneCrossShuffle, FinalShuffle;
+
+  // Attempt a solution with no preshuffle (save 1 vpshufb)
+  if (getLaneCrossShuffle(64, NumElts, NumLanes, Mask, SrcUsage,
+      PreShuffle, LaneCrossShuffle, FinalShuffle))
+    return getOutputNode(PreShuffle, LaneCrossShuffle, FinalShuffle);
+  if (getLaneCrossShuffle(32, NumElts, NumLanes, Mask, SrcUsage,
+      PreShuffle, LaneCrossShuffle, FinalShuffle))
+    return getOutputNode(PreShuffle, LaneCrossShuffle, FinalShuffle);
+
+  // Attempt to shuffle to a friendlier state
+  for (int LaneNum = 0; LaneNum < NumLanes; LaneNum++) {
+    MutableArrayRef<int> Lane { &PreShuffle[LaneNum * NumEltsPerLane],
+      static_cast<size_t>(NumEltsPerLane) };
+
+
+    // Sorting by SrcUsage value will gather elements needed by similar lanes
+    // TODO: This doesn't work too well for 4-lane shuffles or ones that reuse
+    // elements
+    std::stable_sort(Lane.begin(), Lane.end(), [&](int a, int b){
+      return SrcUsage[a] < SrcUsage[b];
+    });
+  }
+
+  if (getLaneCrossShuffle(64, NumElts, NumLanes, Mask, SrcUsage,
+      PreShuffle, LaneCrossShuffle, FinalShuffle))
+    return getOutputNode(PreShuffle, LaneCrossShuffle, FinalShuffle);
+  if (getLaneCrossShuffle(32, NumElts, NumLanes, Mask, SrcUsage,
+      PreShuffle, LaneCrossShuffle, FinalShuffle))
+    return getOutputNode(PreShuffle, LaneCrossShuffle, FinalShuffle);
+
+  return SDValue();
+}
+
 /// Lower a vector shuffle crossing multiple 128-bit lanes as
 /// a lane permutation followed by a per-lane permutation.
 ///
@@ -16947,6 +17129,10 @@ static SDValue lowerV32I8Shuffle(const SDLoc &DL, ArrayRef<int> Mask,
       return V;
 
     if (SDValue V = lowerShuffleAsLanePermuteAndPermute(
+            DL, MVT::v32i8, V1, V2, Mask, DAG, Subtarget))
+      return V;
+
+    if (SDValue V = lowerShuffleAsSublanePermuteAndPermute(
             DL, MVT::v32i8, V1, V2, Mask, DAG, Subtarget))
       return V;
 
