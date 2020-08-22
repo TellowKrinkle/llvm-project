@@ -15531,6 +15531,65 @@ static SDValue lowerShuffleAsLanePermuteAndSHUFP(const SDLoc &DL, MVT VT,
                      DAG.getTargetConstant(SHUFPMask, DL, MVT::i8));
 }
 
+/// Helper for lowerShuffleAsLanePermuteAndPermute
+/// Attempts to find a sublane permute with the given size
+/// that gets all elements into their target lanes
+///
+/// If successful, fills CrossLaneMask and InLaneMask and returns true
+/// If unsuccessful, returns false and may overwrite CrossLaneMask or InLaneMask
+static bool getSublanePermute(int NumSublanes, int NumLanes, int NumElts,
+                              ArrayRef<int> Mask,
+                              SmallVectorImpl<int> &CrossLaneMask,
+                              SmallVectorImpl<int> &InLaneMask) {
+  int NumSublanesPerLane = NumSublanes / NumLanes;
+  int NumEltsPerSublane = NumElts / NumSublanes;
+  int NumEltsPerLane = NumEltsPerSublane * NumSublanesPerLane;
+
+  // CrossLaneMask but one entry == one sublane
+  SmallVector<int, 16> CrossLaneMaskLarge(NumSublanes, SM_SentinelUndef);
+  InLaneMask.assign(NumElts, SM_SentinelUndef);
+
+  for (int i = 0; i != NumElts; ++i) {
+    int M = Mask[i];
+    if (M < 0)
+      continue;
+
+    int SrcSublane = M / NumEltsPerSublane;
+    int DstLane = i / NumEltsPerLane;
+
+    // We only need to get the elements into the right lane, not sublane
+    // So search all sublanes that make up the destination lane
+    bool Found = false;
+    int DstSubStart = DstLane * NumSublanesPerLane;
+    int DstSubEnd = DstSubStart + NumSublanesPerLane;
+    for (int DstSublane = DstSubStart; DstSublane < DstSubEnd; ++DstSublane) {
+      if (!isUndefOrEqual(CrossLaneMaskLarge[DstSublane], SrcSublane))
+        continue;
+
+      Found = true;
+      CrossLaneMaskLarge[DstSublane] = SrcSublane;
+      int DstSublaneOffset = DstSublane * NumEltsPerSublane;
+      InLaneMask[i] = DstSublaneOffset + M % NumEltsPerSublane;
+      break;
+    }
+    if (!Found)
+      return false;
+  }
+
+  // Fill CrossLaneMask using CrossLaneMaskLarge
+  CrossLaneMask.assign(NumElts, SM_SentinelUndef);
+  for (int Sublane = 0; Sublane != NumSublanes; ++Sublane) {
+    if (CrossLaneMaskLarge[Sublane] < 0)
+      continue;
+    int SublaneOffset = CrossLaneMaskLarge[Sublane] * NumEltsPerSublane;
+    for (int i = 0; i != NumEltsPerSublane; ++i) {
+      CrossLaneMask[Sublane * NumEltsPerSublane + i] = SublaneOffset + i;
+    }
+  }
+
+  return true;
+}
+
 /// Lower a vector shuffle crossing multiple 128-bit lanes as
 /// a lane permutation followed by a per-lane permutation.
 ///
@@ -15546,52 +15605,44 @@ static SDValue lowerShuffleAsLanePermuteAndPermute(
   int NumLanes = VT.getSizeInBits() / 128;
   int NumEltsPerLane = NumElts / NumLanes;
 
-  SmallVector<int, 4> SrcLaneMask(NumLanes, SM_SentinelUndef);
-  SmallVector<int, 16> PermMask(NumElts, SM_SentinelUndef);
+  SmallVector<int, 16> CrossLaneMask, InLaneMask;
 
-  for (int i = 0; i != NumElts; ++i) {
-    int M = Mask[i];
-    if (M < 0)
-      continue;
-
-    // Ensure that each lane comes from a single source lane.
-    int SrcLane = M / NumEltsPerLane;
-    int DstLane = i / NumEltsPerLane;
-    if (!isUndefOrEqual(SrcLaneMask[DstLane], SrcLane))
+  if (Subtarget.hasAVX2() && V2.isUndef()) {
+    // First attempt a solution with 64-bit sublanes (vpermq)
+    if (!getSublanePermute(/*NumSublanes=*/NumLanes * 2, NumLanes, NumElts,
+                           Mask, CrossLaneMask, InLaneMask)) {
+      // If that doesn't work and we have fast variable shuffle,
+      // attempt 32-bit sublanes (vpermd)
+      if (!Subtarget.hasFastVariableShuffle())
+        return SDValue();
+      if (!getSublanePermute(/*NumSublanes=*/NumLanes * 4, NumLanes, NumElts,
+                             Mask, CrossLaneMask, InLaneMask))
+        return SDValue();
+    }
+  } else {
+    if (!getSublanePermute(/*NumSublanes=*/NumLanes, NumLanes, NumElts, Mask,
+                           CrossLaneMask, InLaneMask))
       return SDValue();
-    SrcLaneMask[DstLane] = SrcLane;
 
-    PermMask[i] = (DstLane * NumEltsPerLane) + (M % NumEltsPerLane);
+    // If we're only shuffling a single lowest lane and the rest are identity
+    // then don't bother.
+    // TODO: isShuffleMaskInputInPlace could be extended to something like this.
+    int NumIdentityLanes = 0;
+    bool OnlyShuffleLowestLane = true;
+    for (int i = 0; i != NumLanes; ++i) {
+      int LaneOffset = i * NumEltsPerLane;
+      if (isSequentialOrUndefInRange(InLaneMask, LaneOffset, NumEltsPerLane,
+                                     i * NumEltsPerLane))
+        NumIdentityLanes++;
+      else if (CrossLaneMask[LaneOffset] != 0)
+        OnlyShuffleLowestLane = false;
+    }
+    if (OnlyShuffleLowestLane && NumIdentityLanes == (NumLanes - 1))
+      return SDValue();
   }
 
-  // Make sure we set all elements of the lane mask, to avoid undef propagation.
-  SmallVector<int, 16> LaneMask(NumElts, SM_SentinelUndef);
-  for (int DstLane = 0; DstLane != NumLanes; ++DstLane) {
-    int SrcLane = SrcLaneMask[DstLane];
-    if (0 <= SrcLane)
-      for (int j = 0; j != NumEltsPerLane; ++j) {
-        LaneMask[(DstLane * NumEltsPerLane) + j] =
-            (SrcLane * NumEltsPerLane) + j;
-      }
-  }
-
-  // If we're only shuffling a single lowest lane and the rest are identity
-  // then don't bother.
-  // TODO - isShuffleMaskInputInPlace could be extended to something like this.
-  int NumIdentityLanes = 0;
-  bool OnlyShuffleLowestLane = true;
-  for (int i = 0; i != NumLanes; ++i) {
-    if (isSequentialOrUndefInRange(PermMask, i * NumEltsPerLane, NumEltsPerLane,
-                                   i * NumEltsPerLane))
-      NumIdentityLanes++;
-    else if (SrcLaneMask[i] != 0 && SrcLaneMask[i] != NumLanes)
-      OnlyShuffleLowestLane = false;
-  }
-  if (OnlyShuffleLowestLane && NumIdentityLanes == (NumLanes - 1))
-    return SDValue();
-
-  SDValue LanePermute = DAG.getVectorShuffle(VT, DL, V1, V2, LaneMask);
-  return DAG.getVectorShuffle(VT, DL, LanePermute, DAG.getUNDEF(VT), PermMask);
+  SDValue CrossLane = DAG.getVectorShuffle(VT, DL, V1, V2, CrossLaneMask);
+  return DAG.getVectorShuffle(VT, DL, CrossLane, DAG.getUNDEF(VT), InLaneMask);
 }
 
 /// Lower a vector shuffle crossing multiple 128-bit lanes by shuffling one
