@@ -2648,7 +2648,7 @@ define <32 x i8> @load_sext_32i1_to_32i8(<32 x i1> *%ptr) nounwind readnone {
 ; AVX2-LABEL: load_sext_32i1_to_32i8:
 ; AVX2:       # %bb.0: # %entry
 ; AVX2-NEXT:    vmovd {{.*#+}} xmm0 = mem[0],zero,zero,zero
-; AVX2-NEXT:    vpermq {{.*#+}} ymm0 = ymm0[0,1,0,1]
+; AVX2-NEXT:    vpbroadcastq %xmm0, %ymm0
 ; AVX2-NEXT:    vpshufb {{.*#+}} ymm0 = ymm0[0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,18,18,18,18,18,18,18,18,19,19,19,19,19,19,19,19]
 ; AVX2-NEXT:    vpbroadcastq {{.*#+}} ymm1 = [9241421688590303745,9241421688590303745,9241421688590303745,9241421688590303745]
 ; AVX2-NEXT:    vpand %ymm1, %ymm0, %ymm0

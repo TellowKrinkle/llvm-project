@@ -378,7 +378,7 @@ define <32 x i8> @ext_i32_32i8(i32 %a0) {
 ; AVX2-LABEL: ext_i32_32i8:
 ; AVX2:       # %bb.0:
 ; AVX2-NEXT:    vmovd %edi, %xmm0
-; AVX2-NEXT:    vpermq {{.*#+}} ymm0 = ymm0[0,1,0,1]
+; AVX2-NEXT:    vpbroadcastq %xmm0, %ymm0
 ; AVX2-NEXT:    vpshufb {{.*#+}} ymm0 = ymm0[0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,18,18,18,18,18,18,18,18,19,19,19,19,19,19,19,19]
 ; AVX2-NEXT:    vpbroadcastq {{.*#+}} ymm1 = [9241421688590303745,9241421688590303745,9241421688590303745,9241421688590303745]
 ; AVX2-NEXT:    vpand %ymm1, %ymm0, %ymm0
@@ -673,7 +673,7 @@ define <64 x i8> @ext_i64_64i8(i64 %a0) {
 ; AVX2-LABEL: ext_i64_64i8:
 ; AVX2:       # %bb.0:
 ; AVX2-NEXT:    vmovq %rdi, %xmm0
-; AVX2-NEXT:    vpermq {{.*#+}} ymm1 = ymm0[0,1,0,1]
+; AVX2-NEXT:    vpbroadcastq %xmm0, %ymm1
 ; AVX2-NEXT:    vpshufb {{.*#+}} ymm0 = ymm1[0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,18,18,18,18,18,18,18,18,19,19,19,19,19,19,19,19]
 ; AVX2-NEXT:    vpbroadcastq {{.*#+}} ymm2 = [9241421688590303745,9241421688590303745,9241421688590303745,9241421688590303745]
 ; AVX2-NEXT:    vpand %ymm2, %ymm0, %ymm0
