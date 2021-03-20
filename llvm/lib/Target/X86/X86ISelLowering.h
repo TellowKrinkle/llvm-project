@@ -899,6 +899,10 @@ namespace llvm {
     /// legal as the hook is used before type legalization.
     bool isSafeMemOpType(MVT VT) const override;
 
+    /// Return true if a mulh[s|u] node for a specific type is cheaper than
+    /// a multiply followed by a shift. This is false by default.
+    bool isMulhCheaperThanMulShift(EVT Type) const override;
+
     /// Returns true if the target allows unaligned memory accesses of the
     /// specified type. Returns whether it is "fast" in the last argument.
     bool allowsMisalignedMemoryAccesses(EVT VT, unsigned AS, unsigned Align,

@@ -2294,6 +2294,14 @@ bool X86TargetLowering::isSafeMemOpType(MVT VT) const {
   return true;
 }
 
+bool X86TargetLowering::isMulhCheaperThanMulShift(EVT Type) const {
+  // Vector types generally work better with dedicated mulh code,
+  //  as expanding to a larger-than-supported vector ends up using
+  //  complicated shuffles to get everything back together afterwards
+  return Type.isVector() && Subtarget.hasSSE2()
+    && isOperationLegalOrCustom(ISD::MULHS, Type);
+}
+
 bool X86TargetLowering::allowsMisalignedMemoryAccesses(
     EVT VT, unsigned, unsigned Align, MachineMemOperand::Flags Flags,
     bool *Fast) const {
